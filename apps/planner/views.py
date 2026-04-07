@@ -7,6 +7,8 @@ from rest_framework.views import APIView
 
 from apps.planner.models import PlannerLog, StudyPlan, StudySession
 from apps.planner.serializers import (
+    PlannerAIDraftRequestSerializer,
+    PlannerAISaveSerializer,
     GeneratePlanSerializer,
     PlannerAIRequestSerializer,
     PlannerLogSerializer,
@@ -157,5 +159,51 @@ class PlannerAIAssistantView(APIView):
         serializer.is_valid(raise_exception=True)
         data = PlannerAIService.study_assistant(user=request.user, **serializer.validated_data)
         return api_success(data, "AI study guidance generated successfully.")
+
+
+class PlannerAIDraftView(APIView):
+    permission_classes = [IsStudent]
+
+    def post(self, request):
+        serializer = PlannerAIDraftRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = PlannerAIService.generate_custom_plan_draft(
+            user=request.user,
+            study_scope=serializer.validated_data["studyScope"],
+            target_name=serializer.validated_data["targetName"],
+            duration_value=serializer.validated_data["durationValue"],
+            duration_unit=serializer.validated_data["durationUnit"],
+            excluded_days=serializer.validated_data.get("excludedDays", []),
+            instructions=serializer.validated_data.get("instructions", ""),
+            model=serializer.validated_data.get("model"),
+        )
+        return api_success(data, "AI draft plan generated successfully.")
+
+
+class PlannerAISaveView(APIView):
+    permission_classes = [IsStudent]
+
+    def post(self, request):
+        serializer = PlannerAISaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        plan, sessions = PlannerService.save_custom_plan(user=request.user, draft=serializer.validated_data)
+        return api_success(
+            {"plan": StudyPlanSerializer(plan).data, "sessions": StudySessionSerializer(sessions, many=True).data},
+            "AI study plan saved successfully.",
+            201,
+        )
+
+
+class PlannerAIPlanUpdateView(APIView):
+    permission_classes = [IsStudent]
+
+    def patch(self, request, plan_id):
+        serializer = PlannerAISaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        plan, sessions = PlannerService.save_custom_plan(user=request.user, draft=serializer.validated_data, plan_id=plan_id)
+        return api_success(
+            {"plan": StudyPlanSerializer(plan).data, "sessions": StudySessionSerializer(sessions, many=True).data},
+            "AI study plan updated successfully.",
+        )
 
 # Create your views here.

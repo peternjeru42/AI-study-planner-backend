@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib import error, request
 
 from django.conf import settings
@@ -40,6 +40,10 @@ class PlannerAIService:
         return cls.MODEL_OPTIONS
 
     @staticmethod
+    def _api_key():
+        return getattr(settings, "OPENAI_API_KEY", None) or getattr(settings, "OPEN_AI_API_KEY", None)
+
+    @staticmethod
     def _extract_text(payload):
         choices = payload.get("choices") or []
         if not choices:
@@ -59,6 +63,124 @@ class PlannerAIService:
                 return "\n".join(fragments).strip()
 
         raise ValidationError("OpenAI returned an unexpected response format.")
+
+    @staticmethod
+    def _extract_json(text):
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            lines = candidate.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            candidate = "\n".join(lines).strip()
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("OpenAI did not return valid JSON for the study plan draft.") from exc
+
+    @staticmethod
+    def _parse_date(value):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"sessions": ["Each session must include a valid sessionDate in YYYY-MM-DD format."]}) from exc
+
+    @staticmethod
+    def _parse_time(value, field_name):
+        try:
+            return datetime.strptime(value, "%H:%M").time()
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"sessions": [f"Each session must include a valid {field_name} in HH:MM format."]}) from exc
+
+    @classmethod
+    def _normalize_custom_plan_draft(cls, *, user, payload, study_scope, target_name, duration_value, duration_unit, excluded_days, instructions, model):
+        profile = user.student_profile
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, list) or not sessions:
+            raise ValidationError({"sessions": ["OpenAI returned an empty study plan."]})
+
+        excluded = {day.lower() for day in excluded_days}
+        normalized_sessions = []
+
+        for index, item in enumerate(sessions, start=1):
+            if not isinstance(item, dict):
+                raise ValidationError({"sessions": ["OpenAI returned an invalid session payload."]})
+
+            session_date = cls._parse_date(item.get("sessionDate"))
+            if session_date.strftime("%A").lower() in excluded:
+                raise ValidationError({"excludedDays": [f"Generated session falls on excluded day: {session_date.strftime('%A')}"]})
+            if not profile.weekend_available and session_date.weekday() >= 5:
+                raise ValidationError({"sessions": ["Generated session falls on a weekend even though weekends are unavailable."]})
+
+            start_time = cls._parse_time(item.get("startTime"), "startTime")
+            end_time_value = item.get("endTime")
+            duration_value_raw = item.get("duration")
+
+            if duration_value_raw in (None, "") and end_time_value in (None, ""):
+                raise ValidationError({"sessions": ["Each session must include either duration or endTime."]})
+
+            if duration_value_raw in (None, ""):
+                end_time = cls._parse_time(end_time_value, "endTime")
+                duration_minutes = int(
+                    (datetime.combine(session_date, end_time) - datetime.combine(session_date, start_time)).total_seconds() / 60
+                )
+            else:
+                duration_minutes = int(duration_value_raw)
+                if duration_minutes <= 0:
+                    raise ValidationError({"sessions": ["Session duration must be greater than zero."]})
+                end_time = cls._parse_time(end_time_value, "endTime") if end_time_value else (
+                    datetime.combine(session_date, start_time) + timedelta(minutes=duration_minutes)
+                ).time()
+
+            if end_time <= start_time:
+                raise ValidationError({"sessions": ["Session end time must be after start time."]})
+
+            if start_time < profile.preferred_study_start_time or end_time > profile.preferred_study_end_time:
+                raise ValidationError(
+                    {
+                        "sessions": [
+                            f"Generated session '{item.get('title') or f'Session {index}'}' falls outside the preferred study window."
+                        ]
+                    }
+                )
+
+            normalized_sessions.append(
+                {
+                    "tempId": item.get("tempId") or f"draft-session-{index}",
+                    "title": item.get("title") or f"{target_name} Session {index}",
+                    "sessionDate": session_date.isoformat(),
+                    "startTime": start_time.strftime("%H:%M"),
+                    "endTime": end_time.strftime("%H:%M"),
+                    "duration": duration_minutes,
+                    "sessionType": item.get("sessionType") or "revision",
+                    "notes": item.get("notes") or "",
+                }
+            )
+
+        normalized_sessions.sort(key=lambda item: (item["sessionDate"], item["startTime"]))
+        start_date = normalized_sessions[0]["sessionDate"]
+        end_date = normalized_sessions[-1]["sessionDate"]
+
+        return {
+            "model": model,
+            "promptSummary": payload.get("summary") or f"Study {target_name} for {duration_value} {duration_unit}.",
+            "draft": {
+                "title": payload.get("title") or f"{target_name} Study Plan",
+                "studyScope": study_scope,
+                "targetName": target_name,
+                "durationValue": duration_value,
+                "durationUnit": duration_unit,
+                "excludedDays": excluded_days,
+                "instructions": instructions,
+                "summary": payload.get("summary") or "",
+                "startDate": start_date,
+                "endDate": end_date,
+                "sessions": normalized_sessions,
+            },
+        }
 
     @classmethod
     def _build_context(cls, user):
@@ -155,9 +277,9 @@ class PlannerAIService:
         if model and model not in cls.MODEL_IDS:
             raise ValidationError({"model": "Unsupported model selected."})
 
-        api_key = getattr(settings, "OPENAI_API_KEY", None)
+        api_key = cls._api_key()
         if not api_key:
-            raise ValidationError("OPENAI_API_KEY is not configured.")
+            raise ValidationError("OpenAI API key is not configured.")
 
         selected_model = model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5-mini")
         if selected_model not in cls.MODEL_IDS:
@@ -199,3 +321,88 @@ class PlannerAIService:
                 "sessionsCount": len(context["sessions"]),
             },
         }
+
+    @classmethod
+    def generate_custom_plan_draft(
+        cls,
+        *,
+        user,
+        study_scope,
+        target_name,
+        duration_value,
+        duration_unit,
+        excluded_days,
+        instructions="",
+        model=None,
+    ):
+        if model and model not in cls.MODEL_IDS:
+            raise ValidationError({"model": "Unsupported model selected."})
+
+        api_key = cls._api_key()
+        if not api_key:
+            raise ValidationError("OpenAI API key is not configured.")
+
+        selected_model = model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5-mini")
+        if selected_model not in cls.MODEL_IDS:
+            selected_model = "gpt-5-mini"
+
+        context = cls._build_context(user)
+        profile = user.student_profile
+        excluded_days_text = ", ".join(excluded_days) if excluded_days else "none"
+        example = "For instance I want to study Discrete maths unit for 10 hours a week excluding Tuesdays, create a study plan."
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a study-plan generator inside StudyFlow. "
+                    "Return valid JSON only. Do not add markdown, explanation, or code fences. "
+                    "Build a realistic study plan that respects the user's study window, max sessions per day, and excluded days."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Student context:\n{json.dumps(context, indent=2)}\n\n"
+                    f"Create a study plan draft for this {study_scope}: {target_name}\n"
+                    f"Target duration: {duration_value} {duration_unit}\n"
+                    f"Excluded days: {excluded_days_text}\n"
+                    f"Extra instructions: {instructions or 'none'}\n"
+                    f"Example intent: {example}\n\n"
+                    f"Use only times between {profile.preferred_study_start_time.strftime('%H:%M')} and "
+                    f"{profile.preferred_study_end_time.strftime('%H:%M')}. "
+                    f"Use no more than {profile.max_sessions_per_day} sessions per day. "
+                    "Return JSON with this shape:\n"
+                    "{"
+                    '"title":"string",'
+                    '"summary":"string",'
+                    '"sessions":['
+                    '{'
+                    '"title":"string",'
+                    '"sessionDate":"YYYY-MM-DD",'
+                    '"startTime":"HH:MM",'
+                    '"endTime":"HH:MM",'
+                    '"duration":90,'
+                    '"sessionType":"reading|revision|assignment_work|exam_prep|project_work",'
+                    '"notes":"string"'
+                    "}"
+                    "]"
+                    "}\n"
+                    "Return 3 to 14 sessions."
+                ),
+            },
+        ]
+
+        payload = cls._request_completion(api_key=api_key, model=selected_model, messages=messages)
+        draft_payload = cls._extract_json(cls._extract_text(payload))
+        return cls._normalize_custom_plan_draft(
+            user=user,
+            payload=draft_payload,
+            study_scope=study_scope,
+            target_name=target_name,
+            duration_value=duration_value,
+            duration_unit=duration_unit,
+            excluded_days=excluded_days,
+            instructions=instructions,
+            model=selected_model,
+        )

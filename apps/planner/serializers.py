@@ -63,6 +63,7 @@ class StudyPlanSerializer(serializers.ModelSerializer):
     createdAt = serializers.DateTimeField(source="created_at")
     updatedAt = serializers.DateTimeField(source="updated_at")
     sessions = StudySessionSerializer(many=True, read_only=True)
+    aiDraft = serializers.SerializerMethodField()
 
     class Meta:
         model = StudyPlan
@@ -76,7 +77,32 @@ class StudyPlanSerializer(serializers.ModelSerializer):
             "createdAt",
             "updatedAt",
             "sessions",
+            "aiDraft",
         ]
+
+    def get_aiDraft(self, obj):
+        if obj.generation_trigger != "ai_custom":
+            return None
+        log = obj.logs.filter(trigger_source__in=["ai_custom", "ai_custom_updated"]).order_by("-created_at").first()
+        if not log:
+            return None
+        payload = log.input_snapshot_json
+        sessions = []
+        for item in payload.get("sessions", []):
+            session = dict(item)
+            if session.get("startTime"):
+                session["startTime"] = str(session["startTime"])[:5]
+            if session.get("endTime"):
+                session["endTime"] = str(session["endTime"])[:5]
+            if session.get("sessionDate"):
+                session["sessionDate"] = str(session["sessionDate"])[:10]
+            sessions.append(session)
+        payload["sessions"] = sessions
+        if payload.get("startDate"):
+            payload["startDate"] = str(payload["startDate"])[:10]
+        if payload.get("endDate"):
+            payload["endDate"] = str(payload["endDate"])[:10]
+        return payload
 
 
 class PlannerLogSerializer(serializers.ModelSerializer):
@@ -100,6 +126,75 @@ class GeneratePlanSerializer(serializers.Serializer):
 class PlannerAIRequestSerializer(serializers.Serializer):
     model = serializers.CharField(required=False, allow_blank=True, max_length=64)
     question = serializers.CharField(max_length=2000)
+
+
+class PlannerAIDraftRequestSerializer(serializers.Serializer):
+    model = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    studyScope = serializers.ChoiceField(choices=["unit", "topic", "course"])
+    targetName = serializers.CharField(max_length=255)
+    durationValue = serializers.IntegerField(min_value=1, max_value=365)
+    durationUnit = serializers.ChoiceField(choices=["hours", "days", "weeks"])
+    excludedDays = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+            ]
+        ),
+        required=False,
+        allow_empty=True,
+    )
+    instructions = serializers.CharField(required=False, allow_blank=True, max_length=4000)
+
+
+class PlannerAIDraftSessionSerializer(serializers.Serializer):
+    tempId = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    title = serializers.CharField(max_length=255)
+    sessionDate = serializers.DateField(input_formats=["%Y-%m-%d"], format="%Y-%m-%d")
+    startTime = serializers.TimeField(input_formats=["%H:%M"], format="%H:%M")
+    endTime = serializers.TimeField(input_formats=["%H:%M"], format="%H:%M")
+    duration = serializers.IntegerField(min_value=1, max_value=1440)
+    sessionType = serializers.ChoiceField(choices=["reading", "revision", "assignment_work", "exam_prep", "project_work"])
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class PlannerAISaveSerializer(serializers.Serializer):
+    model = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    title = serializers.CharField(max_length=255)
+    studyScope = serializers.ChoiceField(choices=["unit", "topic", "course"])
+    targetName = serializers.CharField(max_length=255)
+    durationValue = serializers.IntegerField(min_value=1, max_value=365)
+    durationUnit = serializers.ChoiceField(choices=["hours", "days", "weeks"])
+    excludedDays = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+            ]
+        ),
+        required=False,
+        allow_empty=True,
+    )
+    instructions = serializers.CharField(required=False, allow_blank=True)
+    summary = serializers.CharField(required=False, allow_blank=True)
+    startDate = serializers.DateField(input_formats=["%Y-%m-%d"], format="%Y-%m-%d")
+    endDate = serializers.DateField(input_formats=["%Y-%m-%d"], format="%Y-%m-%d")
+    sessions = PlannerAIDraftSessionSerializer(many=True)
+
+    def validate(self, attrs):
+        if not attrs["sessions"]:
+            raise serializers.ValidationError({"sessions": ["At least one session is required."]})
+        return attrs
 
 
 class SessionStatusUpdateSerializer(serializers.Serializer):
